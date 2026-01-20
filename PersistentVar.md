@@ -11,7 +11,9 @@ No VAR_PERSISTENT list is part of the application to enter instance path for var
 
 ## Why Persistent Variables Matter
 
-`SysFileWrite()` accepts a pointer parameter (`pbyBuffer := ADR(...)`). This pointer must reference memory that survives across task cycles. Local stack variables deallocate after each cycle, invalidating the pointer.
+`SysFileWrite()` accepts a pointer parameter (`pbyBuffer := ADR(...)`). This pointer must reference memory that survives across task cycles.
+
+**Technical Detail:** Pointers require either `VAR_GLOBAL` or `VAR_PERSISTENT` memory. Local stack variables deallocate after each cycle, invalidating the pointer. Using `PERSISTENT` adds durability (data retention on power loss), which benefits logging diagnostics.
 
 **Result of using local variables:** Undefined behavior, silent data corruption, or runtime crash on next file write attempt.
 
@@ -68,7 +70,7 @@ VAR
 END_VAR
 ```
 
-### 4. CSV Build & Write Pattern
+### 4. CSV Build & Write Pattern (Testing Phase)
 ```structured_text
 FOR i := 0 TO 226 DO
     (* Build CSV line in local variable *)
@@ -93,6 +95,21 @@ FOR i := 0 TO 226 DO
 END_FOR;
 ```
 
+## ⚠️ Performance Warnings (TESTING PHASE)
+
+### CONCAT Loop Overhead
+`CONCAT` rescans the entire string for null terminator on each call. 227 iterations × multiple CONCAT calls = significant CPU spike.
+
+**Monitor:** Task Cycle Time in Machine Expert diagnostics. If approaching Watchdog threshold (typically 100ms), reduce iterations per cycle or implement Phase 2 optimization.
+
+### SysFileWrite Blocking Behavior
+`SysFileWrite()` is synchronous (blocking). Calling it 227 times in a single cycle may trigger Watchdog timeout if task cycle time exceeds configured threshold.
+
+**Monitor:** Watchdog exception logs. If triggered, implement Phase 2 solution.
+
+### SD Card Wear
+Writing 227 times per cycle accelerates SD card controller wear. This is acceptable for testing/development but not sustainable for production.
+
 ## Key Points
 
 | Aspect | Local `sCsvLine` | Persistent `sCsvLinePersist` |
@@ -110,7 +127,16 @@ After implementation, rebuild project:
 - **Expected result:** 0 errors, no C0569 warnings for these variables
 - **If warnings persist:** Verify PersistentVars object exists at application level (not inside task)
 
+## Phase 2: Production Optimization (Deferred)
+
+Future improvements to address performance and SD card wear:
+- Single `SysFileWrite()` call per cycle (buffer all 227 lines, write once)
+- Investigate `FileFormatUtility` library for asynchronous CSV writing
+- Use `MEMCPY` or `StringUtils` for efficient string concatenation
+- Implement write buffering strategy
+
 ## Reference
 - SE Documentation: Persistent Variables require dedicated list object at application level
-- SysFileWrite parameter `pbyBuffer` must reference valid persistent memory address
+- SysFileWrite parameter `pbyBuffer` must reference valid persistent memory address (VAR_GLOBAL or VAR_PERSISTENT)
 - ADR() function returns memory address of variable — must survive across task cycles
+- CONCAT performance: Suitable for small operations; inefficient for large string building loops
