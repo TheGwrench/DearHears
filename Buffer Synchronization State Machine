@@ -1,0 +1,285 @@
+# Buffer Synchronization State Machine - Phase 0 Design
+
+## Overview
+5-state machine prevents race conditions between CAN_RX and LOG_ToSD buffer access.
+
+---
+
+## STATE DEFINITIONS & TRANSITIONS
+
+| State | Description | CAN_RX Can Write? | LOG_ToSD Can Read? | Transition Trigger | Next State | Error Handling |
+|-------|-------------|-------------------|-------------------|-------------------|-----------|-----------------|
+| **IDLE** | System startup, no active operation | NO | NO | CAN_RX receives first message | CAN_WRITING_A | None |
+| **CAN_WRITING_A** | CAN_RX filling Buffer A (0-226 entries) | YES (to A) | YES (from B) | Buffer A reaches 227 entries | LOG_READING_B* | Timeout if takes >5s (log error, continue) |
+| **LOG_READING_B** | LOG_ToSD reading Buffer B (while CAN fills A) | YES (to A) | YES (from B) | LOG_ToSD completes read | GRACE_PERIOD_B | Timeout >2s (skip log, set error 0x1004, return to CAN_WRITING_A) |
+| **CAN_WRITING_B** | CAN_RX filling Buffer B (0-226 entries) | YES (to B) | YES (from A) | Buffer B reaches 227 entries | LOG_READING_A* | Timeout if takes >5s (log error, continue) |
+| **LOG_READING_A** | LOG_ToSD reading Buffer A (while CAN fills B) | YES (to B) | YES (from A) | LOG_ToSD completes read | GRACE_PERIOD_A | Timeout >2s (skip log, set error 0x1004, return to CAN_WRITING_B) |
+| **ERROR** | Invalid state or deadlock detected | NO | NO | Manual reset or timeout recovery | IDLE | Log error code, alert operator |
+
+*Grace period inserted between LOG completion and next CAN write (150ms minimum)
+
+---
+
+## DETAILED STATE LOGIC
+
+### STATE: IDLE
+```
+Entry:  System startup
+Action: Await first CAN message
+Exit:   CAN_RX receives message, buffer index = 0
+Next:   CAN_WRITING_A
+```
+
+**Transition Condition:**
+```
+IF (uiBufferIndex = 0 AND new CAN message received) THEN
+    eBufferState := CAN_WRITING_A
+    GVL.xBufferAActive := TRUE
+END_IF
+```
+
+---
+
+### STATE: CAN_WRITING_A
+```
+Entry:  CAN_RX starts writing to Buffer A
+Action: Write incoming CAN messages to A[0..226]
+Exit:   Buffer A full (227 entries)
+Next:   LOG_READING_B (immediately)
+```
+
+**Transition Condition:**
+```
+IF (uiBufferIndex >= 227) THEN
+    uiBufferIndex := 0
+    xLogBufferReady := TRUE              (* Signal LOG_ToSD that B is ready *)
+    eBufferState := LOG_READING_B
+    tLogTimeoutStart := CURRENT_TIME_MS
+END_IF
+```
+
+**Error Condition:**
+```
+IF (CURRENT_TIME_MS - tStateStartTime > 5000ms) THEN
+    GVL.gLogErrorCode := 0x1005         (* CAN write timeout *)
+    (* Continue anyway — CAN reception priority *)
+END_IF
+```
+
+---
+
+### STATE: LOG_READING_B
+```
+Entry:  LOG_ToSD detects xLogBufferReady = TRUE
+Action: LOG_ToSD reads all 227 entries from Buffer B
+Exit:   LOG_ToSD completes read, file written
+Next:   GRACE_PERIOD_B (150ms wait before CAN reuses B)
+```
+
+**Transition Condition:**
+```
+IF (bLogReading = FALSE AND log write complete) THEN
+    xLogBufferReady := FALSE            (* Clear ready signal *)
+    eBufferState := GRACE_PERIOD_B
+    tGracePeriodStart := CURRENT_TIME_MS
+END_IF
+```
+
+**Error Condition - Timeout:**
+```
+IF (CURRENT_TIME_MS - tLogTimeoutStart > 2000ms) THEN
+    GVL.gLogErrorCode := 0x1004         (* LOG_ToSD timeout *)
+    GVL.uiLogErrorCount := uiLogErrorCount + 1
+    (* Force recovery: abandon this log, continue CAN *)
+    xLogBufferReady := FALSE
+    eBufferState := CAN_WRITING_A       (* Resume CAN writes, skip this log *)
+END_IF
+```
+
+---
+
+### STATE: GRACE_PERIOD_B
+```
+Entry:  LOG_ToSD finished reading Buffer B
+Action: Wait 150ms to ensure LOG_ToSD fully released
+Exit:   Grace period elapsed
+Next:   CAN_WRITING_B (CAN resumes writing to B)
+```
+
+**Transition Condition:**
+```
+IF (CURRENT_TIME_MS - tGracePeriodStart >= 150ms) THEN
+    eBufferState := CAN_WRITING_B
+    GVL.xBufferAActive := FALSE         (* Signal: now writing to B *)
+    tStateStartTime := CURRENT_TIME_MS
+END_IF
+```
+
+---
+
+### STATE: CAN_WRITING_B
+```
+Entry:  CAN_RX starts writing to Buffer B
+Action: Write incoming CAN messages to B[0..226]
+Exit:   Buffer B full (227 entries)
+Next:   LOG_READING_A (immediately)
+```
+
+**Transition Condition:**
+```
+IF (uiBufferIndex >= 227) THEN
+    uiBufferIndex := 0
+    xLogBufferReady := TRUE              (* Signal LOG_ToSD that A is ready *)
+    eBufferState := LOG_READING_A
+    tLogTimeoutStart := CURRENT_TIME_MS
+END_IF
+```
+
+**Error Condition:**
+```
+IF (CURRENT_TIME_MS - tStateStartTime > 5000ms) THEN
+    GVL.gLogErrorCode := 0x1005         (* CAN write timeout *)
+    (* Continue anyway — CAN reception priority *)
+END_IF
+```
+
+---
+
+### STATE: LOG_READING_A
+```
+Entry:  LOG_ToSD detects xLogBufferReady = TRUE
+Action: LOG_ToSD reads all 227 entries from Buffer A
+Exit:   LOG_ToSD completes read, file written
+Next:   GRACE_PERIOD_A (150ms wait before CAN reuses A)
+```
+
+**Transition Condition:**
+```
+IF (bLogReading = FALSE AND log write complete) THEN
+    xLogBufferReady := FALSE            (* Clear ready signal *)
+    eBufferState := GRACE_PERIOD_A
+    tGracePeriodStart := CURRENT_TIME_MS
+END_IF
+```
+
+**Error Condition - Timeout:**
+```
+IF (CURRENT_TIME_MS - tLogTimeoutStart > 2000ms) THEN
+    GVL.gLogErrorCode := 0x1004         (* LOG_ToSD timeout *)
+    GVL.uiLogErrorCount := uiLogErrorCount + 1
+    (* Force recovery: abandon this log, continue CAN *)
+    xLogBufferReady := FALSE
+    eBufferState := CAN_WRITING_B       (* Resume CAN writes, skip this log *)
+END_IF
+```
+
+---
+
+### STATE: GRACE_PERIOD_A
+```
+Entry:  LOG_ToSD finished reading Buffer A
+Action: Wait 150ms to ensure LOG_ToSD fully released
+Exit:   Grace period elapsed
+Next:   CAN_WRITING_A (CAN resumes writing to A)
+```
+
+**Transition Condition:**
+```
+IF (CURRENT_TIME_MS - tGracePeriodStart >= 150ms) THEN
+    eBufferState := CAN_WRITING_A
+    GVL.xBufferAActive := TRUE          (* Signal: now writing to A *)
+    tStateStartTime := CURRENT_TIME_MS
+END_IF
+```
+
+---
+
+### STATE: ERROR
+```
+Entry:  Invalid state transition or deadlock detected
+Action: Log error, stop all operations
+Exit:   Manual intervention or timeout
+Next:   IDLE (reset)
+```
+
+**Error Recovery:**
+```
+IF (xForceReset OR timeout > 10s) THEN
+    eBufferState := IDLE
+    xLogBufferReady := FALSE
+    bLogReading := FALSE
+    GVL.gLogErrorCode := 0x1001         (* State machine error *)
+END_IF
+```
+
+---
+
+## IMPLEMENTATION SEQUENCE
+
+1. **Add GVL state machine variables** (already done)
+2. **Update CAN_RX task:**
+   - Replace `xBufferAActive` logic with state machine
+   - Add grace period tracking
+   - Add timeout checks
+   - Never block on `bLogReading` — CAN_RX timeout → skip, set error, continue
+3. **Update LOG_ToSD task:**
+   - Change from cyclic (200ms) to event-driven
+   - Wait for `xLogBufferReady = TRUE` before reading
+   - Set `bLogReading := TRUE` at start, `FALSE` at completion
+   - Add timeout protection (2s max read time)
+   - Handle timeout gracefully (skip log, continue)
+
+---
+
+## STATE MACHINE DIAGRAM
+
+```
+        IDLE
+         |
+         | (CAN message received)
+         v
+    CAN_WRITING_A ←--→ GRACE_PERIOD_A ←--→ LOG_READING_A
+         |                                      |
+         +------→ LOG_READING_B                |
+                       |                       |
+                  GRACE_PERIOD_B ←--→ CAN_WRITING_B
+                                          ^
+                                          |
+                                    (cycle repeats)
+         
+         ERROR ←--(timeout/deadlock)-- (any state)
+         |
+         └--→ IDLE (manual reset)
+```
+
+---
+
+## ERROR CODE MAPPING
+
+| Error Code | Meaning | Recovery |
+|-----------|---------|----------|
+| 0x0000 | No error | Continue normal operation |
+| 0x1000 | Log swap timeout | Continue CAN, skip this log cycle |
+| 0x1001 | State machine error | Reset to IDLE, alert operator |
+| 0x1002 | Deadlock detected | Force timeout, reset to IDLE |
+| 0x1003 | Buffer corrupted | Skip log, continue CAN |
+| 0x1004 | LOG_ToSD timeout | Abandon read, return to CAN write state |
+| 0x1005 | CAN write timeout | Continue anyway (CAN priority) |
+| 0x0014 | Invalid file handle | Close file, wait for next swap |
+| 0x0032 | File write error | Skip this log, continue CAN |
+| 0x0029 | Disk full | Alert operator, continue CAN |
+
+---
+
+## TIMING REQUIREMENTS
+
+| Event | Max Duration | Recovery |
+|-------|--------------|----------|
+| CAN fills buffer (227 msgs) | 5 seconds | Log error, continue |
+| LOG reads buffer | 2 seconds | Skip log, timeout error, continue CAN |
+| Grace period | 150 ms minimum | Ensures complete release before reuse |
+| Error recovery | 10 seconds max | Force reset if deadlock detected |
+
+---
+
+**Ready to implement state machine in CAN_RX and LOG_ToSD?**
